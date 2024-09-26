@@ -142,10 +142,10 @@ class UserState(StatesGroup):
 
 
 # Метод для отправки сообщения от имени бота
-@dp.message(F.reply_to_message.__and__(F.chat.id == OWNER).__and__(F.reply_to_message.caption.startswith("ID")))
+@dp.message(F.reply_to_message.__and__(F.chat.id == OWNER).__and__(F.reply_to_message.text.startswith("ID")))
 @security()
 async def _sender(message: Message):
-    user_id = int(message.reply_to_message.caption.split('\n', 1)[0].replace("ID: ", ""))
+    user_id = int(message.reply_to_message.text.split('\n', 1)[0].replace("ID: ", ""))
     try:
         copy_message = await bot.copy_message(user_id, OWNER, message.message_id)
     except Exception as e:
@@ -703,7 +703,7 @@ def entities_format_str(entities: str) -> list[MessageEntity]:
 
 
 def entities_format_list(entities: list[MessageEntity]) -> str:
-    result = [entity.model_dump() for entity in entities]
+    result = [entity.model_dump() for entity in entities or []]
     return json.JSONEncoder().encode(result)
 
 
