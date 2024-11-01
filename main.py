@@ -2,10 +2,11 @@ import re
 import sys
 import json
 import string
+import hashlib
 import asyncio
 import aiohttp
 from typing import Literal
-from sys_keys import TOKEN, api_key, process_id
+from sys_keys import TOKEN, api_key
 from datetime import datetime, timedelta
 from core import (
     db,
@@ -30,6 +31,7 @@ from core import (
 from aiogram import Bot, Dispatcher, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters.command import Command, CommandStart
 from aiogram.types import InlineKeyboardMarkup as IMarkup
 from aiogram.types import InlineKeyboardButton as IButton
@@ -116,13 +118,15 @@ class Settings:
 
 # Класс с глобальными переменными для удобного пользования
 class Data:
-    url_select_datetime = "https://tgmaksim.ru/reminder_maksim_bot_select/datetime?time_zone="
-    url_select_time = "https://tgmaksim.ru/reminder_maksim_bot_select/time?time_zone="
+    url_select_datetime = "https://reminder.tgmaksim.ru/bot/select-datetime?time_zone="
+    url_select_time = "https://reminder.tgmaksim.ru/bot/select-time?time_zone="
+    url_mini_app = "https://reminder.tgmaksim.ru/app/loading"
+    url_settings_time_zone = "https://reminder.tgmaksim.ru/bot/settings/time_zone"
     users = set()
     settings: dict[int, Settings] = {}
     reminders: list[Reminder] = []
+    reminders_hash = ""
     text_frequency = {"day": "Каждый день", "week": "Каждую неделю", "month": "Каждый месяц"}
-    text_replay = {"5minutes": "через 5 минут", "hour": "через час", "day": "через день", "week": "через неделю"}
     frequency_reminders = (
         ("Каждый день", "day"),
         ("Каждую неделю", "week"),
@@ -133,7 +137,7 @@ class Data:
 # Класс нужен для определения состояния пользователя в данном боте,
 # например: пользователь должен отправить отзыв в следующем сообщении
 class UserState(StatesGroup):
-    review = State('review')
+    feedback = State('feedback')
 
     create_new_reminder = State('create_new_reminder')
     create_new_often_reminder = State('create_new_often_reminder')
@@ -146,6 +150,25 @@ class UserState(StatesGroup):
     select_time_zone = State('select_time_zone')
     edit_reminder = State('edit_reminder')
     set_publish = State('set_publish')
+    replay_reminder = State('replay_reminder')
+
+
+# Метод для добавления и изменения "знакомых"
+@dp.message(Command('new_acquaintance'))
+@security()
+async def _new_acquaintance(message: Message):
+    if await developer_command(message): return
+    if message.reply_to_message and message.reply_to_message.caption:
+        id = int(message.reply_to_message.caption.split('\n', 1)[0].replace("ID: ", ""))
+        name = message.text.split(maxsplit=1)[1]
+    else:
+        id, name = message.text.split(maxsplit=2)[1:]
+    if await db.execute("SELECT id FROM acquaintances WHERE id=?", (id,)):
+        await db.execute("UPDATE acquaintances SET name=? WHERE id=?", (name, id))
+        await message.answer("Данные знакомого изменены")
+    else:
+        await db.execute("INSERT INTO acquaintances VALUES(?, ?)", (id, name))
+        await message.answer("Добавлен новый знакомый!")
 
 
 # Метод для отправки сообщения от имени бота
@@ -179,14 +202,17 @@ async def _admin(message: Message):
 @security()
 async def _reload(message: Message):
     if await developer_command(message): return
-    await message.answer(f"*Перезапуск бота*", parse_mode=markdown)
-    print("Перезапуск бота")
     if sys.argv[1] == "release":
-        await dp.stop_polling()
-        asyncio.get_event_loop().stop()  # netangels после остановки фонового процесса автоматически запустит его
+        await message.answer("*Перезапуск бота*", parse_mode=markdown)
+        print("Перезапуск бота")
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://panel.netangels.ru/api/gateway/token/", data={"api_key": api_key}) as response:
+                token = (await response.json())['token']  # получение Bearer-токена
+                await session.put("https://api-ms.netangels.ru/api/v1/hosting/virtualhosts/297559/restart/",
+                                  headers={"Authorization": f"Bearer {token}"})
     else:
-        await dp.stop_polling()
-        asyncio.get_event_loop().stop()
+        await message.answer("В тестовом режиме перезапуск бота программно не предусмотрен!")
+        print("В тестовом режиме перезапуск бота программно не предусмотрен!")
 
 
 @dp.message(Command('stop'))
@@ -197,11 +223,12 @@ async def _stop(message: Message):
     print("Остановка бота")
     if sys.argv[1] == "release":
         async with aiohttp.ClientSession() as session:
-            async with session.post("https://panel.netangels.ru/api/gateway/token/",
-                                    data={"api_key": api_key}) as response:
-                token = (await response.json())['token']
-                await session.post(f"https://api-ms.netangels.ru/api/v1/hosting/background-processes/{process_id}/stop",
-                                   headers={"Authorization": f"Bearer {token}"})
+            async with session.post("https://panel.netangels.ru/api/gateway/token/", data={"api_key": api_key}) as response:
+                token = (await response.json())['token']  # получение Bearer-токена
+                await session.put("https://api-ms.netangels.ru/api/v1/hosting/virtualhosts/297559/disable/",
+                                  headers={"Authorization": f"Bearer {token}"})
+        await dp.stop_polling()
+        asyncio.get_event_loop().stop()
     else:
         await dp.stop_polling()
         asyncio.get_event_loop().stop()
@@ -211,24 +238,10 @@ async def _stop(message: Message):
 @security()
 async def _db(message: Message):
     if await developer_command(message): return
-    await message.answer_document(FSInputFile(resources_path(db.db_path)))
-
-
-@dp.message(Command('new_acquaintance'))
-@security()
-async def _new_acquaintance(message: Message):
-    if await developer_command(message): return
-    if message.reply_to_message and message.reply_to_message.caption:
-        id = int(message.reply_to_message.caption.split('\n', 1)[0].replace("ID: ", ""))
-        name = message.text.split(maxsplit=1)[1]
+    if sys.argv[1] == "release":
+        await message.answer("Основной режим программы не позволяет отправить файл базы данных")
     else:
-        id, name = message.text.split(maxsplit=2)[1:]
-    if await db.execute("SELECT id FROM acquaintances WHERE id=?", (id,)):
-        await db.execute("UPDATE acquaintances SET name=? WHERE id=?", (name, id))
-        await message.answer("Данные знакомого изменены")
-    else:
-        await db.execute("INSERT INTO acquaintances VALUES(?, ?)", (id, name))
-        await message.answer("Добавлен новый знакомый!")
+        await message.answer_document(FSInputFile(resources_path(db.db_path)))
 
 
 @dp.message(Command('all_reminders'))
@@ -244,40 +257,40 @@ async def _all_reminders(message: Message):
     await message.answer(text=text, parse_mode=html)
 
 
-@dp.message(Command('review'))
+@dp.message(Command('feedback'))
 @security('state')
-async def _start_review(message: Message, state: FSMContext):
+async def _start_feedback(message: Message, state: FSMContext):
     if await new_message(message): return
-    await state.set_state(UserState.review)
-    markup = IMarkup(inline_keyboard=[[IButton(text="❌", callback_data="stop_review")]])
+    await state.set_state(UserState.feedback)
+    markup = IMarkup(inline_keyboard=[[IButton(text="❌", callback_data="stop_feedback")]])
     await message.answer("Отправьте текст вопроса или предложения. Любое следующее сообщение будет считаться отзывом",
                          reply_markup=markup)
 
 
-@dp.message(UserState.review)
+@dp.message(UserState.feedback)
 @security('state')
-async def _review(message: Message, state: FSMContext):
-    if await new_message(message, False): return
+async def _feedback(message: Message, state: FSMContext):
+    if await new_message(message, forward=False): return
     await state.clear()
     acquaintance = await username_acquaintance(message)
     acquaintance = f"<b>Знакомый: {acquaintance}</b>\n" if acquaintance else ""
     await bot.send_photo(OWNER,
-                         photo=FSInputFile(resources_path("resources/reviews.png")),
+                         photo=FSInputFile(resources_path("feedback.png")),
                          caption=f"ID: {message.chat.id}\n"
-                            f"{acquaintance}" +
-                            (f"USERNAME: @{message.from_user.username}\n" if message.from_user.username else "") +
-                            f"Имя: {message.from_user.first_name}\n" +
-                            (f"Фамилия: {message.from_user.last_name}\n" if message.from_user.last_name else "") +
-                            f"Время: {omsk_time(message.date)}",
+                                 f"{acquaintance}" +
+                                 (f"USERNAME: @{message.from_user.username}\n" if message.from_user.username else "") +
+                                 f"Имя: {message.from_user.first_name}\n" +
+                                 (f"Фамилия: {message.from_user.last_name}\n" if message.from_user.last_name else "") +
+                                 f"Время: {omsk_time(message.date)}",
                          parse_mode=html)
     await message.forward(OWNER)
     await message.answer("Большое спасибо за отзыв!❤️❤️❤️")
 
 
-@dp.callback_query(F.data == "stop_review")
+@dp.callback_query(F.data == "sop_feedback")
 @security('state')
-async def _stop_review(callback_query: CallbackQuery, state: FSMContext):
-    if await new_callback_query(callback_query, "Стоп отправке отзыва"): return
+async def _stop_feedback(callback_query: CallbackQuery, state: FSMContext):
+    if await new_callback_query(callback_query): return
     await state.clear()
     await callback_query.message.edit_text("Отправка отзыва отменена")
 
@@ -299,11 +312,22 @@ async def _version(message: Message):
 @dp.callback_query(F.data == 'subscribe')
 @security()
 async def _check_subscribe(callback_query: CallbackQuery):
-    if await new_callback_query(callback_query, "Вроде подписан"): return
+    if await new_callback_query(callback_query, check_subscribe=False): return
     if (await bot.get_chat_member(channel, callback_query.message.chat.id)).status == 'left':
         await callback_query.answer("Вы не подписались на наш канал😢", True)
+        await callback_query.bot.send_message(OWNER, "Пользователь не подписался на канал")
     else:
         await callback_query.answer("Спасибо за подписку!❤️ Продолжайте пользоваться ботом", True)
+        await callback_query.bot.send_message(OWNER, "Пользователь подписался на канал. Ему предоставлен полный доступ")
+
+
+@dp.message(Command("webapp"))
+@security()
+async def _webapp(message: Message):
+    if await new_message(message): return
+    await bot.unpin_all_chat_messages(message.chat.id)
+    markup = IMarkup(inline_keyboard=[[IButton(text="Приложение", web_app=WebAppInfo(url=Data.url_mini_app))]])
+    await bot.pin_chat_message(message.chat.id, (await message.answer("Приложение", reply_markup=markup)).message_id)
 
 
 @dp.message(CommandStart())
@@ -409,14 +433,15 @@ async def _help(message: Message):
 @dp.callback_query(F.data == "help")
 @security()
 async def _help_button(callback_query: CallbackQuery):
-    if await new_callback_query(callback_query, "Помогите"): return
+    if await new_callback_query(callback_query): return
     await callback_query.message.edit_reply_markup()
     await help(callback_query.message)
 
 
 async def help(message: Message):
-    await message.answer("/review - оставить отзыв или предложение\n"
+    await message.answer("/feedback - оставить отзыв или предложение\n"
                          "/settings - настройки\n"
+                         "/webapp - закрепить кнопку с приложением\n"
                          "/new_reminder - создать новое напоминание\n"
                          "/new_today_reminder - напоминание на сегодня\n"
                          "/new_tomorrow_reminder - напоминание на завтра\n"
@@ -437,7 +462,7 @@ async def _settings(message: Message):
 @dp.callback_query(F.data == "settings")
 @security()
 async def _settings_button(callback_query: CallbackQuery):
-    if await new_callback_query(callback_query, "Настройки"): return
+    if await new_callback_query(callback_query): return
     markup = IMarkup(inline_keyboard=[[IButton(
         text="Выбрать часовой пояс", callback_data="select_time_zone")]])
     await callback_query.message.edit_reply_markup()
@@ -447,10 +472,14 @@ async def _settings_button(callback_query: CallbackQuery):
 @dp.callback_query(F.data == "select_time_zone")
 @security('state')
 async def _select_time_zone(callback_query: CallbackQuery, state: FSMContext):
-    if await new_callback_query(callback_query, "Выбрать часовой пояс"): return
+    if await new_callback_query(callback_query): return
     await callback_query.message.edit_reply_markup()
     await state.clear()
-    await callback_query.message.answer("Пришлите мне ваш часовой пояс, например: Москва - 3, Омск - 6")
+    markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(
+        text="Выбрать часовой пояс", web_app=WebAppInfo(url=Data.url_settings_time_zone))],
+        [KeyboardButton(text="Отмена")]])
+    await callback_query.message.answer("Пришлите мне ваш часовой пояс, например: Москва - +3, Омск - +6\n"
+                                        "Или нажмите ниже для автоматического выбора 👇", reply_markup=markup)
     await state.set_state(UserState.select_time_zone)
 
 
@@ -458,15 +487,20 @@ async def _select_time_zone(callback_query: CallbackQuery, state: FSMContext):
 @security('state')
 async def _edit_time_zone(message: Message, state: FSMContext):
     if await new_message(message): return
+    if message.text == "Отмена":
+        await state.clear()
+        return await message.answer("Вы всегда можете выбрать часовой пояс в настройках",
+                                    reply_markup=ReplyKeyboardRemove())
     try:
-        time_zone = int(message.text)
+        time_zone = int(message.text or message.web_app_data.data)
     except ValueError:
         await message.reply("Это не число!")
     else:
         await set_time_zone(message.chat.id, time_zone)
         Data.settings[message.chat.id].time_zone = str(time_zone)
         await state.clear()
-        await message.answer(f"Вы успешно изменили часовой пояс на {'+' if time_zone > 0 else ''}{time_zone}")
+        await message.answer(f"Вы успешно изменили часовой пояс на {'+' if time_zone > 0 else ''}{time_zone}",
+                             reply_markup=ReplyKeyboardRemove())
 
 
 @dp.message(Command('cancel'))
@@ -495,7 +529,7 @@ async def _my_reminders(message: Message):
 @dp.callback_query(F.data == "edit_reminder")
 @security()
 async def _confirm_edit_reminder(callback_query: CallbackQuery):
-    if await new_callback_query(callback_query, "Подтверждение изменения"): return
+    if await new_callback_query(callback_query): return
     await callback_query.message.edit_text(callback_query.message.text + "\n\n✅Хорошо!")
     markup = IMarkup(inline_keyboard=[[IButton(text="Текст", callback_data="edit_text_of_reminder")],
                                       [IButton(text="Время", callback_data="edit_time_of_reminder")]])
@@ -505,7 +539,7 @@ async def _confirm_edit_reminder(callback_query: CallbackQuery):
 @dp.callback_query(F.data == "not_edit_reminder")
 @security('state')
 async def _not_edit_reminder(callback_query: CallbackQuery, state: FSMContext):
-    if await new_callback_query(callback_query, "Отмена изменения"): return
+    if await new_callback_query(callback_query): return
     await callback_query.message.edit_text(callback_query.message.text + "\n\n❌Хорошо!")
     await state.clear()
 
@@ -513,7 +547,7 @@ async def _not_edit_reminder(callback_query: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "delete_reminder")
 @security('state')
 async def _confirm_delete_reminder(callback_query: CallbackQuery, state: FSMContext):
-    if await new_callback_query(callback_query, "Подтверждение удаления"): return
+    if await new_callback_query(callback_query): return
     await callback_query.message.edit_text(callback_query.message.text + "\n\n✅Хорошо!")
     data = await state.get_data()
     id = data['id']
@@ -535,7 +569,7 @@ async def _confirm_delete_reminder(callback_query: CallbackQuery, state: FSMCont
 @dp.callback_query(F.data == "not_delete_reminder")
 @security('state')
 async def _not_delete_reminder(callback_query: CallbackQuery, state: FSMContext):
-    if new_callback_query(callback_query, "Отмена удаления"): return
+    if new_callback_query(callback_query): return
     await callback_query.message.edit_text(callback_query.message.text + "\n\n❌Хорошо!")
     await state.clear()
 
@@ -543,7 +577,7 @@ async def _not_delete_reminder(callback_query: CallbackQuery, state: FSMContext)
 @dp.callback_query(F.data == "edit_text_of_reminder")
 @security('state')
 async def _edit_text_of_reminder(callback_query: CallbackQuery, state: FSMContext):
-    if await new_callback_query(callback_query, "Изменить текст"): return
+    if await new_callback_query(callback_query): return
     await state.set_state(UserState.edit_reminder)
     await state.update_data(edit_reminder="text")
     await callback_query.message.edit_text(callback_query.message.text + "\nТекст", reply_markup=None)
@@ -553,13 +587,13 @@ async def _edit_text_of_reminder(callback_query: CallbackQuery, state: FSMContex
 @dp.callback_query(F.data == "edit_time_of_reminder")
 @security('state')
 async def _edit_time_of_reminder(callback_query: CallbackQuery, state: FSMContext):
-    if await new_callback_query(callback_query, "Изменить время"): return
+    if await new_callback_query(callback_query): return
     await state.set_state(UserState.edit_reminder)
     await state.update_data(edit_reminder="time")
     await callback_query.message.edit_text(callback_query.message.text + "\nВремя", reply_markup=None)
     time_zone = Data.settings[callback_query.message.chat.id].time_zone
     markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Выбрать дату и время...", web_app=WebAppInfo(
-        url=Data.url_select_datetime + time_zone))]])
+        url=Data.url_select_datetime + time_zone))], [KeyboardButton(text="Отмена")]])
     await callback_query.message.answer("Отправьте мне новое время напоминания или нажмите ниже", reply_markup=markup)
 
 
@@ -576,6 +610,8 @@ async def _edit_reminder(message: Message, state: FSMContext):
     if edit == "text":
         if message.content_type != "text":
             return await message.answer("Пока что напоминалка работает только с текстом!")
+        if len(message.text) > 128:
+            return await message.answer("Текст напоминания не может быть больше 128 символов")
         text = message.text
         entities = message.entities
         await state.clear()
@@ -589,6 +625,9 @@ async def _edit_reminder(message: Message, state: FSMContext):
         else:
             await message.answer("Текст напоминания изменен!")
     else:
+        if message.text == "Отмена":
+            await state.clear()
+            return await message.answer("Изменение напоминания отменено", reply_markup=ReplyKeyboardRemove())
         if message.content_type not in ("text", "web_app_data"):
             return await message.answer("Некорректно!")
         str_time = message.text if message.text else message.web_app_data.data
@@ -635,13 +674,14 @@ async def _text_reminder(message: Message, state: FSMContext):
     if await new_message(message): return
     if not message.text:
         return await message.answer("Пока что напоминалка работает только с текстом!")
+    if len(message.text) > 128:
+        return await message.answer("Текст напоминания не может быть больше 128 символов")
     day = (await state.get_data())['day']
     await state.update_data(text=message.text, entities=message.entities)
     time_zone = Data.settings[message.chat.id].time_zone
-    markup = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(
-            text="Выбрать дату и время...",
-            web_app=WebAppInfo(url=Data.url_select_datetime + time_zone if not day else Data.url_select_time + time_zone))]])
+    markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Выбрать дату и время...", web_app=WebAppInfo(
+        url=Data.url_select_datetime + time_zone if not day else Data.url_select_time + time_zone))],
+                                           [KeyboardButton(text="Отмена")]])
     await message.answer(f"Отправьте *время* напоминания или нажмите ниже\n"
                          "Чтобы отменить - /cancel", parse_mode=markdown, reply_markup=markup)
     await state.set_state(UserState.text_new_reminder)
@@ -653,10 +693,12 @@ async def _text_often_reminder(message: Message, state: FSMContext):
     if await new_message(message): return
     if not message.text:
         return await message.answer("Пока что напоминалка работает только с текстом!")
+    if len(message.text) > 128:
+        return await message.answer("Текст напоминания не может быть больше 128 символов")
     await state.update_data(text=message.text, entities=message.entities)
     time_zone = Data.settings[message.chat.id].time_zone
-    markup = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Выбрать дату и время...", web_app=WebAppInfo(url=Data.url_select_datetime + time_zone))]])
+    markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Выбрать дату и время...", web_app=WebAppInfo(
+        url=Data.url_select_datetime + time_zone))], [KeyboardButton(text="Отмена")]])
     await message.answer("Отправьте *время* напоминания или нажмите ниже\n"
                          "Чтобы отменить - /cancel", parse_mode=markdown, reply_markup=markup)
     await state.set_state(UserState.text_new_often_reminder)
@@ -666,6 +708,9 @@ async def _text_often_reminder(message: Message, state: FSMContext):
 @security('state')
 async def _time_reminder(message: Message, state: FSMContext):
     if await new_message(message): return
+    if message.text == "Отмена":
+        await state.clear()
+        return await message.answer("Создание напоминания отменено", reply_markup=ReplyKeyboardRemove())
     if message.content_type not in ("text", "web_app_data"):
         return await message.answer("Некорректно!")
     time = message.text if message.text else message.web_app_data.data
@@ -681,7 +726,8 @@ async def _time_reminder(message: Message, state: FSMContext):
             answer = await create_new_reminder(text, f"{now.year}/{now.month}/{now.day} {time}",
                                                message.chat.id, entities, time_zone, -1)
         case 'tomorrow':
-            answer = await create_new_reminder(text, f"{now.year}/{now.month}/{now.day + 1} {time}",
+            tomorrow = now + timedelta(days=1)
+            answer = await create_new_reminder(text, f"{tomorrow.year}/{tomorrow.month}/{tomorrow.day} {time}",
                                                message.chat.id, entities, time_zone, -1)
         case _:
             return
@@ -698,6 +744,9 @@ async def _time_reminder(message: Message, state: FSMContext):
 @security('state')
 async def _time_often_reminder(message: Message, state: FSMContext):
     if await new_message(message): return
+    if message.text == "Отмена":
+        await state.clear()
+        return await message.answer("Создание частого напоминания отменено", reply_markup=ReplyKeyboardRemove())
     if message.content_type not in ("text", "web_app_data"):
         return await message.answer("Некорректно!")
     text = message.text if message.text else message.web_app_data.data
@@ -718,7 +767,7 @@ async def _time_often_reminder(message: Message, state: FSMContext):
 @dp.callback_query(UserState.time_new_often_reminder, F.data.in_(list(Data.text_frequency)))
 @security('state')
 async def _frequency_reminder(callback_query: CallbackQuery, state: FSMContext):
-    if await new_callback_query(callback_query, "Частое напоминание"): return
+    if await new_callback_query(callback_query): return
     data = await state.get_data()
     text = data['text']
     time = data['time']
@@ -732,31 +781,75 @@ async def _frequency_reminder(callback_query: CallbackQuery, state: FSMContext):
                                            parse_mode=markdown)
 
 
-@dp.callback_query(F.data.in_([f"replay_{i}" for i in Data.text_replay]))
+@dp.callback_query(F.data == "replay_reminder")
 @security()
 async def _replay_reminder(callback_query: CallbackQuery):
-    if await new_callback_query(callback_query, "Повторить напоминание"): return
-    replay = callback_query.data.replace("replay_", "", 1)
-    add = {"day": timedelta(days=1), "week": timedelta(weeks=1),
-           "5minutes": timedelta(minutes=5), "hour": timedelta(hours=1)}
-    time = omsk_time(callback_query.message.date) + add[replay]
-    text = callback_query.message.text
-    entities = callback_query.message.entities or []
-    time_zone = Data.settings[callback_query.from_user.id].time_zone
-    await create_new_reminder(text, time.strftime('%Y/%m/%d %H.%M'), callback_query.message.chat.id, entities, time_zone, -1)
-    await callback_query.message.delete_reply_markup()
-    await callback_query.message.reply(f"Напоминание повторено {Data.text_replay[replay]}")
+    if await new_callback_query(callback_query): return
+    await callback_query.message.edit_reply_markup()
+    markup = IMarkup(inline_keyboard=[[IButton(text="несколько минут", callback_data=f"replay_after_minutes")],
+                                      [IButton(text="несколько часов", callback_data=f"replay_after_hours")]])
+    await callback_query.message.reply("Повторить напоминание через...\n"
+                                       "<span class='tg-spoiler'>Нажмите на кнопку, а потом напишите число</span>",
+                                       reply_markup=markup, parse_mode=html)
+
+
+@dp.callback_query(F.data.startswith("replay_after"))
+@security('state')
+async def _replay_reminder_after(callback_query: CallbackQuery, state: FSMContext):
+    if await new_callback_query(callback_query): return
+    await state.set_state(UserState.replay_reminder)
+    time = callback_query.data.replace("replay_after_", "", 1)
+    await state.update_data(time=time, message_id=callback_query.message.reply_to_message.message_id,
+                            reminder_text=callback_query.message.reply_to_message.text,
+                            reminder_entities=callback_query.message.reply_to_message.entities)
+    await callback_query.message.edit_text(f"Через сколько {'минут' if time == 'minutes' else 'часов'} повторить напоминание?")
+
+
+@dp.message(UserState.replay_reminder)
+@security('state')
+async def _replay_reminder_after_time(message: Message, state: FSMContext):
+    if await new_message(message): return
+    if not str(message.text).isdigit():
+        return await message.answer("Вы не ввели число!")
+    data = await state.get_data()
+    time: str = data['time']
+    reminder_text: str = data['reminder_text']
+    reminder_entities: list = data['reminder_entities']
+    message_id: int = data['message_id']
+    if time == "minutes":
+        add = timedelta(minutes=int(message.text))
+    else:
+        add = timedelta(hours=int(message.text))
+    time: datetime = omsk_time(message.date) + add
+    request = await create_new_reminder(reminder_text, time.strftime('%Y/%m/%d %H.%M'),
+                                        message.chat.id, reminder_entities, "6", -1)
+    if request == -1:
+        await message.answer("Это время уже прошло!")
+    else:
+        await bot.send_message(message.chat.id, f"Напоминание скопировано. Время: {time.hour}:{time.minute}",
+                               reply_to_message_id=message_id)
 
 
 @dp.callback_query()
 @security()
 async def _other_callback_query(callback_query: CallbackQuery):
-    await new_callback_query(callback_query, "Неизвестно...")
+    await new_callback_query(callback_query)
 
 
 @dp.message()
 @security()
 async def _other_messages(message: Message):
+    if message.content_type == "pinned_message":
+        await message.delete()
+        return
+    if message.content_type == "write_access_allowed":
+        markup = IMarkup(inline_keyboard=[[IButton(text="Мои функции", callback_data="help")],
+                                          [IButton(text="Настройки", callback_data="settings")]])
+        await message.answer(f"Привет, {await username_acquaintance(message, 'first_name')}\n"
+                             f"[tgmaksim.ru]({SITE})",
+                             parse_mode=markdown, reply_markup=markup)
+        markup = IMarkup(inline_keyboard=[[IButton(text="Приложение", web_app=WebAppInfo(url=Data.url_mini_app))]])
+        await bot.pin_chat_message(message.chat.id, (await message.answer("Приложение", reply_markup=markup)).message_id)
     await new_message(message)
 
 
@@ -833,25 +926,36 @@ def check_reminder(reminder_id: int, user_id: int | Literal["all"]) -> int | Lit
 
 async def wait_reminders():
     while True:
+        await load_reminders()
+
         delete_reminders = []
         for i, reminder in enumerate(Data.reminders):
             if reminder():
                 await send_reminder(reminder)
                 not reminder.frequency and delete_reminders.append(i)
-        for i in delete_reminders:
+        for i in reversed(delete_reminders):
             Data.reminders.pop(i)
         await asyncio.sleep(60)
 
 
+async def load_reminders():
+    reminder_hash = (await db.execute("SELECT value FROM system_data WHERE key=?", ("reminders_hash",)))[0][0]
+    if Data.reminders_hash != reminder_hash and Data.reminders:
+        reminders = await db.execute("SELECT * FROM reminders")
+        Data.reminders.clear()
+        Data.reminders_hash = reminder_hash
+        for id, chat_id, text, str_time, frequency, entities, publish, parent in reminders:
+            time = check_str_time(str_time)
+            Data.reminders.append(Reminder(id, chat_id, text, time, str_time, frequency, entities_format_str(entities), publish == "1", parent))
+
+
 async def send_reminder(reminder: Reminder):
-    markup = IMarkup(inline_keyboard=[[IButton(
-        text=f"Повторить {Data.text_replay[i]}", callback_data=f"replay_{i}")] for i in Data.text_replay])
+    markup = IMarkup(inline_keyboard=[[IButton(text="Повторить через...", callback_data=f"replay_reminder")]])
     try:
-        await bot.send_sticker(reminder.chat_id,
-                               'CAACAgIAAxkBAAIKU2VEcBh507fXYGMqRZWvNPKFWLslAALvQgACnisgSr_4ZR4YZGHQMwQ')
-        await bot.send_message(reminder.chat_id, reminder.text, entities=reminder.entities, reply_markup=markup if not reminder.frequency else None)
+        await bot.send_message(reminder.chat_id, reminder.text, entities=reminder.entities,
+                               reply_markup=markup if not reminder.frequency else None)
     except Exception as e:
-        await bot.send_message(OWNER, f"Произошла ошибка {e.__class__.__name__} при отправке напоминания: {e}")
+        await bot.send_message(OWNER, f"Произошла ошибка {e.__class__.__name__}при отправке напоминания: {e}")
     else:
         if reminder.chat_id != OWNER:
             await bot.send_message(OWNER, f"Сработала напоминание у {reminder.chat_id}\n{reminder.text}")
@@ -886,18 +990,19 @@ async def developer_command(message: Message) -> bool:
     return message.chat.id != OWNER
 
 
-async def subscribe_to_channel(message: Message):
-    if (await bot.get_chat_member(channel, message.from_user.id)).status == 'left' and not message.text.startswith('/start'):
+async def subscribe_to_channel(id: int, text: str = ""):
+    if (await bot.get_chat_member(channel, id)).status == 'left' and not text.startswith('/start'):
         markup = IMarkup(
             inline_keyboard=[[IButton(text="Подписаться на канал", url=subscribe)],
                              [IButton(text="Подписался", callback_data="subscribe")]])
-        await message.answer("Бот работает только с подписчиками моего канала. "
-                             "Подпишитесь и получите полный доступ к боту", reply_markup=markup)
+        await bot.send_message(id, "Бот работает только с подписчиками моего канала. "
+                                   "Подпишитесь и получите полный доступ к боту", reply_markup=markup)
+        await bot.send_message(OWNER, "Пользователь не подписан на наш канал, доступ ограничен!")
         return False
     return True
 
 
-async def new_message(message: Message, forward: bool = True) -> bool:
+async def new_message(message: Message, /, forward: bool = True) -> bool:
     if message.content_type == "text":
         content = message.text
     elif message.content_type == "web_app_data":
@@ -915,6 +1020,8 @@ async def new_message(message: Message, forward: bool = True) -> bool:
     await db.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)",
                      (id, username, first_name, last_name, content, date))
 
+    await load_reminders()
+
     if message.chat.id == OWNER:
         return False
 
@@ -926,9 +1033,13 @@ async def new_message(message: Message, forward: bool = True) -> bool:
                  (f"USERNAME: @{username}\n" if username else "") +
                  f"Имя: {first_name}\n" +
                  (f"Фамилия: {last_name}\n" if last_name else "") +
+                 f"{content}\n"
                  f"Время: {date}",
             parse_mode=html)
-        await message.forward(OWNER)
+        try:
+            await message.forward(OWNER)
+        except TelegramBadRequest:
+            pass
     elif forward or (message.entities and message.entities[0].type != 'bot_command'):  # Если сообщение содержит форматирование или необходимо переслать сообщение
         if message.entities and message.entities[0].type != 'bot_command':
             await bot.send_message(
@@ -969,32 +1080,25 @@ async def new_message(message: Message, forward: bool = True) -> bool:
 
     if message.chat.id not in Data.users:
         await message.forward(OWNER)
-    if not Data.settings.get(message.chat.id):
-        Data.settings[message.chat.id] = Settings.default(message.chat.id)
-        await set_time_zone(message.chat.id, 6)
-        markup = IMarkup(inline_keyboard=[[IButton(text="Выбрать часовой пояс", callback_data="select_time_zone")]])
-        await message.answer("*У Вас не выбран часовой пояс!* Выберите его сейчас👇 или оставьте часовой пояс по "
-                             "умолчанию: UTC*+06:00* (Омск, Россия)\nВы всегда можете изменить его в настройках "
-                             "/settings", parse_mode=markdown, reply_markup=markup)
     await new_user(message)
 
-    return not await subscribe_to_channel(message)
+    return not await subscribe_to_channel(message.chat.id, message.text)
 
 
-async def new_callback_query(callback_query: CallbackQuery, comment: str) -> bool:
-    message = callback_query.message
-    id = str(message.chat.id)
+async def new_callback_query(callback_query: CallbackQuery, /, check_subscribe: bool = True) -> bool:
+    id = str(callback_query.message.chat.id)
     username = callback_query.from_user.username
     first_name = callback_query.from_user.first_name
     last_name = callback_query.from_user.last_name
     callback_data = callback_query.data
-    date = str(omsk_time(message.date))
-    acquaintance = await username_acquaintance(message)
+    date = str(time_now())
+    acquaintance = await username_acquaintance(callback_query.message)
     acquaintance = f"<b>Знакомый: {acquaintance}</b>\n" if acquaintance else ""
-    comment = f"Комментарий: {comment}\n" if comment else ""
 
     await db.execute("INSERT INTO callbacks_query VALUES (?, ?, ?, ?, ?, ?)",
                      (id, username, first_name, last_name, callback_data, date))
+
+    await load_reminders()
 
     if callback_query.from_user.id != OWNER:
         await bot.send_message(
@@ -1005,10 +1109,12 @@ async def new_callback_query(callback_query: CallbackQuery, comment: str) -> boo
                  f"Имя: {first_name}\n" +
                  (f"Фамилия: {last_name}\n" if last_name else "") +
                  f"CALLBACK_DATA: {callback_data}\n"
-                 f"{comment}"
                  f"Время: {date}",
             parse_mode=html)
 
+    if check_subscribe and not await subscribe_to_channel(callback_query.from_user.id):
+        await callback_query.message.edit_reply_markup()
+        return True
     return False
 
 
@@ -1024,14 +1130,17 @@ async def start_bot():
     await db.execute("CREATE TABLE IF NOT EXISTS reminders (id INTEGER, chat_id INTEGER, text TEXT, "
                      "str_time TEXT, frequency TEXT, entities TEXT, publish TEXT, parent INTEGER)")
     await db.execute("CREATE TABLE IF NOT EXISTS settings (id TEXT, time_zone TEXT)")
-    if not await db.execute("SELECT value FROM system_data WHERE key=?", ("pause",)):
-        await db.execute("INSERT INTO system_data VALUES(?, ?)", ("pause", "False"))
     if not await db.execute("SELECT value FROM system_data WHERE key=?", ("version",)):
         await db.execute("INSERT INTO system_data VALUES(?, ?)", ("version", "0.0"))
     if not await db.execute("SELECT value FROM system_data WHERE key=?", ("max_id_reminder",)):
         await db.execute("INSERT INTO system_data VALUES(?, ?)", ("max_id_reminder", "-1"))
 
-    for id, chat_id, text, str_time, frequency, entities, publish, parent in await db.execute("SELECT * FROM reminders"):
+    reminders = await db.execute("SELECT * FROM reminders")
+    reminders_hash = hashlib.sha1(str(time_now()).encode()).hexdigest()
+    Data.reminders_hash = reminders_hash
+    await db.execute("UPDATE system_data SET value=? WHERE key=?", (reminders_hash, "reminders_hash"))
+
+    for id, chat_id, text, str_time, frequency, entities, publish, parent in reminders:
         time = check_str_time(str_time)
         if not frequency and time <= time_now():
             await db.execute("DELETE FROM reminders WHERE id=?", (id,))

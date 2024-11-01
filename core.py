@@ -1,11 +1,15 @@
 import sys_keys
 import aiosqlite
+import traceback
 from typing import Union
+import mysql.connector.aio as aiomysql
 from datetime import datetime, timedelta
 from aiogram.types import Message, CallbackQuery
 
 OWNER = 5128609241
 NAME = sys_keys.NAME
+mysql = sys_keys.db
+release = sys_keys.release
 SITE = "https://tgmaksim.ru/проекты/напоминалка"
 subscribe = "https://t.me/+toIQibXWy-w1MmVi"
 channel = "@MaksimMyBots"
@@ -14,16 +18,27 @@ markdown = "Markdown"
 html = "HTML"
 
 
-class db:
-    db_path = "db.sqlite3"
+if release:
+    class db:
+        @staticmethod
+        async def execute(sql: str, params: tuple = tuple()) -> list[tuple]:
+            async with await aiomysql.connect(database="c87813_reminder_tgmaksim_ru_reminder", **mysql) as conn:
+                async with await conn.cursor() as cur:
+                    await cur.execute(sql.replace("?", "%s").replace("key", "`key`"), params)
+                    result = await cur.fetchall()
+                await conn.commit()
+            return result
+else:
+    class db:
+        db_path = "db.sqlite3"
 
-    @staticmethod
-    async def execute(sql: str, params: tuple = tuple()) -> tuple[tuple]:
-        async with aiosqlite.connect(resources_path(db.db_path)) as conn:
-            async with conn.execute(sql, params) as cur:
-                result = await cur.fetchall()
-            await conn.commit()
-        return result
+        @staticmethod
+        async def execute(sql: str, params: tuple = tuple()) -> tuple[tuple]:
+            async with aiosqlite.connect(resources_path(db.db_path)) as conn:
+                async with conn.execute(sql, params) as cur:
+                    result = await cur.fetchall()
+                await conn.commit()
+            return result
 
 
 def security(*arguments):
@@ -32,9 +47,8 @@ def security(*arguments):
             try:
                 await fun(_object, **{kw: kwargs[kw] for kw in kwargs if kw in arguments})
             except Exception as e:
-                await _object.bot.send_message(
-                    OWNER, f"⚠️⚠️⚠️\nПроизошла ошибка {e.__class__.__name__} в функции "
-                           f"{fun.__module__}.{fun.__name__}: {e}")
+                exception = "".join(traceback.format_exception(e))
+                await _object.bot.send_message(OWNER, f"⚠️Ошибка⚠️\n\n{exception}")
 
         return new
 
@@ -42,7 +56,7 @@ def security(*arguments):
 
 
 def resources_path(path: str) -> str:
-    return sys_keys.resources_path(path, NAME)
+    return sys_keys.resources_path(path)
 
 
 def time_now() -> datetime:
