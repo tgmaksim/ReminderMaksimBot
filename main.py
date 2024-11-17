@@ -78,24 +78,51 @@ class Reminder:
                     (self.time.weekday(), self.time.hour, self.time.minute)
             case "month":
                 return (now.day, now.hour, now.minute) == (self.time.day, self.time.hour, self.time.minute)
+            case "weekdays":
+                return (now.hour, now.minute) == (self.time.hour, self.time.minute) and now.isoweekday() <= 5
+            case "weekend":
+                return (now.hour, now.minute) == (self.time.hour, self.time.minute) and now.isoweekday() >= 6
         return False
 
-    def my_reminders(self, time_zone: int) -> str:
-        time_reminder = self.time + timedelta(hours=time_zone - 6)
-        str_time = time_reminder.__str__()
+    def my_reminders(self, time_zone: int, only_main_data: bool = False) -> str:
         buttons = f"<a href='t.me/{NAME}?start=delete_reminder_{self.id}'>Удалить</a>"
         if self.publish:
             buttons += f" / <a href='t.me/{NAME}?start=edit_reminder_{self.id}'>Изменить</a>"
             buttons += f"\n<a href='tg://msg_url?url=t.me/{NAME}?start=new_reminder_{self.id}&" \
                        f"text=Я+делюсь+с+тобой+напоминанием'>Поделиться</a>"
+            buttons += f" / <a href='t.me/{NAME}?start=close_reminder_{self.id}'>Закрыть</a>"
         elif self.parent == -1:
             buttons += f" / <a href='t.me/{NAME}?start=edit_reminder_{self.id}'>Изменить</a>"
-            if not self.frequency:
-                buttons += f"\n<a href='t.me/{NAME}?start=set_publish_{self.id}'>Сделать открытым</a>"
-        frequency = f"\nЧастота: {Data.text_frequency[self.frequency].lower()}" if self.frequency else ""
-        publish = "\n❗️Публичное❗️" if self.publish else ""
-        text = f"Текст: {self.text}\nВремя: {str_time}{frequency}{publish}\n{buttons}"
-        return text
+            buttons += f"\n<a href='t.me/{NAME}?start=set_publish_{self.id}'>Сделать открытым</a>"
+        time_reminder = self.time + timedelta(hours=time_zone - 6)
+        match self.frequency:
+            case "day":
+                str_time = f"Каждый день в {time_reminder.strftime('%H:%M')}"
+            case "week":
+                n = time_reminder.weekday()
+                each = "Кажд" + {0: 'ый', 1: 'ый', 2: 'ую', 3: 'ый', 4: 'ую', 5: 'ую', 6: 'ое'}[n]
+                weekday = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"][n]
+                str_time = f"{each} {weekday} в {time_reminder.strftime('%H:%M')}"
+            case "month":
+                str_time = f"{time_reminder.day} числа в {time_reminder.strftime('%H:%M')}"
+            case "weekdays":
+                str_time = f"По будням в {time_reminder.strftime('%H:%M')}"
+            case "weekend":
+                str_time = f"По выходным в {time_reminder.strftime('%H:%M')}"
+            case _:
+                before = (time_reminder - time_now()).total_seconds()
+                if 60 <= before < 60*60:
+                    str_time = f"Через {int(before/60)} минут"
+                elif time_reminder.date() == time_now().date():
+                    str_time = f"Сегодня в {time_reminder.strftime('%H:%M')}"
+                elif time_reminder.date() == time_now().date() + timedelta(days=1):
+                    str_time = f"Завтра в {time_reminder.strftime('%H:%M')}"
+                else:
+                    str_time = time_reminder.strftime("%Y/%m/%d %H:%M")
+        publish = f"\n❗️Публичное❗️ <a href='{SITE}/3.2'>что?</a>" if self.publish else ""
+        if only_main_data:
+            return f"{self.text}\n{str_time}"
+        return f"{self.text}\n{str_time}{publish}\n{buttons}"
 
 
 # Класс пользовательских настроек
@@ -126,11 +153,14 @@ class Data:
     settings: dict[int, Settings] = {}
     reminders: list[Reminder] = []
     reminders_hash = ""
-    text_frequency = {"day": "Каждый день", "week": "Каждую неделю", "month": "Каждый месяц"}
+    text_frequency = {"day": "Каждый день", "week": "Каждую неделю", "month": "Каждый месяц", "weekdays": "По будням",
+                      "weekend": "По выходным"}
     frequency_reminders = (
-        ("Каждый день", "day"),
         ("Каждую неделю", "week"),
         ("Каждый месяц", "month"),
+        ("По будням", "weekdays"),
+        ("По выходным", "weekend"),
+        ("Каждый день", "day"),
     )
 
 
@@ -139,13 +169,11 @@ class Data:
 class UserState(StatesGroup):
     feedback = State('feedback')
 
-    create_new_reminder = State('create_new_reminder')
-    create_new_often_reminder = State('create_new_often_reminder')
-
-    text_new_reminder = State('text_new_reminder')
-    text_new_often_reminder = State('text_new_often_reminder')
-
-    time_new_often_reminder = State('time_new_often_reminder')
+    text_reminder = State('text_reminder')
+    text_often_reminder = State('text_often_reminder')
+    time_reminder = State('time_reminder')
+    time_often_reminder = State('time_often_reminder')
+    frequency_reminder = State('frequency_reminder')
 
     select_time_zone = State('select_time_zone')
     edit_reminder = State('edit_reminder')
@@ -287,7 +315,7 @@ async def _feedback(message: Message, state: FSMContext):
     await message.answer("Большое спасибо за отзыв!❤️❤️❤️")
 
 
-@dp.callback_query(F.data == "sop_feedback")
+@dp.callback_query(F.data == "stop_feedback")
 @security('state')
 async def _stop_feedback(callback_query: CallbackQuery, state: FSMContext):
     if await new_callback_query(callback_query): return
@@ -344,10 +372,8 @@ async def _start(message: Message, state: FSMContext):
         reminder = Data.reminders[index]
         if reminder.publish:
             await state.update_data(id=id, index=index)
-            markup = IMarkup(inline_keyboard=[[IButton(text="Все равно удалить!",
-                                                       callback_data="delete_reminder")],
-                                              [IButton(text="Не удалять...",
-                                                       callback_data="not_edit_reminder")]])
+            markup = IMarkup(inline_keyboard=[[IButton(text="Все равно удалить!", callback_data="delete_reminder")],
+                                              [IButton(text="Не удалять...", callback_data="not_delete_reminder")]])
             await message.answer("*Внимание!*\nДанное напоминание является публичным (открытым). Если Вы удалите его, "
                                  "то оно удалится для всех!", reply_markup=markup, parse_mode=markdown)
         else:
@@ -375,6 +401,8 @@ async def _start(message: Message, state: FSMContext):
         else:
             markup = IMarkup(inline_keyboard=[[IButton(text="Текст", callback_data="edit_text_of_reminder")],
                                               [IButton(text="Время", callback_data="edit_time_of_reminder")]])
+            if reminder.frequency:
+                markup.inline_keyboard.append([IButton(text="Частоту", callback_data="edit_frequency_of_reminder")])
             await message.answer("Что вы хотите изменить в напоминании?", reply_markup=markup)
     elif message.text.startswith('/start set_publish'):
         id = int(message.text.replace("/start set_publish_", "", 1))
@@ -384,10 +412,8 @@ async def _start(message: Message, state: FSMContext):
                 "Напоминание не найдено. Если возникли трудности напишите отзыв, мы во всем разберемся")
             return
         reminder = Data.reminders[index]
-        if reminder.frequency:
-            return await message.answer("Пока что я не могу сделать публичным частое напоминание...")
         if reminder.parent != -1:
-            return await message.answer("Вы не можете сделать публичное напоминание, только удалить!")
+            return await message.answer("Вы не можете сделать публичное напоминание публичным... только удалить!")
         await db.execute("UPDATE reminders SET publish=? WHERE id=?", ("1", id))
         Data.reminders[index].publish = True
         markup = IMarkup(inline_keyboard=[[IButton(text="Поделиться напоминанием",
@@ -411,8 +437,33 @@ async def _start(message: Message, state: FSMContext):
                 "Напоминание не найдено. Если возникли трудности напишите отзыв, мы во всем разберемся")
             return
         reminder = Data.reminders[index]
-        await create_new_reminder(reminder.text, reminder.str_time, message.chat.id, reminder.entities, "6", id)
-        await message.answer("Открытое напоминание скопировано для Вас. Посмотреть все напоминания можно здесь /my_reminders")
+        markup = IMarkup(inline_keyboard=[[IButton(text="Скопировать напоминание", callback_data=f"copy_reminder_{id}")]])
+        await message.answer("<b>Напоминание</b>\n<i>Вы можете скопировать напоминание для себя. Я никому не скажу, "
+                             "что вы сделали это. Владелец также может изменить время и текст открытого напоминания</i>\n\n"
+                             f"{reminder.my_reminders(int(Data.settings[message.chat.id].time_zone), True)}",
+                             parse_mode=html, reply_markup=markup)
+    elif message.text.startswith('/start close_reminder'):
+        id = int(message.text.replace("/start close_reminder_", "", 1))
+        index = check_reminder(id, message.chat.id)
+        if index == "NotFound":
+            await message.answer(
+                "Напоминание не найдено. Если возникли трудности напишите отзыв, мы во всем разберемся")
+            return
+        reminder = Data.reminders[index]
+        if not reminder.publish:
+            return await message.answer("Вы не можете закрыть личное напоминание. Это возможно только с публичными")
+        await state.update_data(id=id)
+        markup = IMarkup(inline_keyboard=[[IButton(text="Все равно закрыть!", callback_data="close_reminder")],
+                                          [IButton(text="Не закрывать...", callback_data="not_close_reminder")]])
+        await message.answer("*Внимание!*\nДанное напоминание является публичным (открытым). Если Вы закроете его, "
+                             "то оно удалится для всех, но останется у Вас!", reply_markup=markup, parse_mode=markdown)
+    elif message.text.startswith("/start feedback"):
+        await state.clear()
+        await (await message.answer("...Удаление клавиатурных кнопок...", reply_markup=ReplyKeyboardRemove())).delete()
+        await state.set_state(UserState.feedback)
+        markup = IMarkup(inline_keyboard=[[IButton(text="❌", callback_data="stop_feedback")]])
+        await message.answer("Отправьте текст вопроса или предложения. Любое следующее сообщение будет считаться отзывом",
+                             reply_markup=markup)
     else:
         await state.clear()
         await (await message.answer("...Удаление клавиатурных кнопок...", reply_markup=ReplyKeyboardRemove())).delete()
@@ -477,7 +528,7 @@ async def _select_time_zone(callback_query: CallbackQuery, state: FSMContext):
     await state.clear()
     markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(
         text="Выбрать часовой пояс", web_app=WebAppInfo(url=Data.url_settings_time_zone))],
-        [KeyboardButton(text="Отмена")]])
+        [KeyboardButton(text="Отмена")]], resize_keyboard=True)
     await callback_query.message.answer("Пришлите мне ваш часовой пояс, например: Москва - +3, Омск - +6\n"
                                         "Или нажмите ниже для автоматического выбора 👇", reply_markup=markup)
     await state.set_state(UserState.select_time_zone)
@@ -523,7 +574,52 @@ async def _my_reminders(message: Message):
     if not user_reminders:
         return await message.answer("У Вас нет активных напоминаний")
     text = "\n\n".join(map(lambda x: x, user_reminders))
-    await message.answer(text=text, parse_mode=html, disable_web_page_preview=True)
+    markup = IMarkup(inline_keyboard=[[IButton(text="Обновить", callback_data="reload_my_reminders")]])
+    await message.answer(text=text, parse_mode=html, disable_web_page_preview=True, reply_markup=markup)
+
+
+@dp.callback_query(F.data == "reload_my_reminders")
+@security()
+async def _reload_my_reminders(callback_query: CallbackQuery):
+    if await new_callback_query(callback_query): return
+    markup = IMarkup(inline_keyboard=[[IButton(text="Обновить", callback_data="reload_my_reminders")]])
+    user_reminders = []
+    time_zone = Data.settings[callback_query.message.chat.id].time_zone
+    for reminder in Data.reminders:
+        if reminder.chat_id == callback_query.message.chat.id:
+            user_reminders.append(reminder.my_reminders(int(time_zone)))
+    if not user_reminders:
+        return await callback_query.message.edit_text("У Вас нет активных напоминаний", reply_markup=markup)
+    text = "\n\n".join(map(lambda x: x, user_reminders))
+    try:
+        await callback_query.message.edit_text(text=text, parse_mode=html, disable_web_page_preview=True, reply_markup=markup)
+    except TelegramBadRequest:
+        await callback_query.answer("Нет изменений!", True)
+
+
+@dp.callback_query(F.data.startswith("copy_reminder"))
+@security()
+async def _copy_reminder(callback_query: CallbackQuery):
+    if await new_callback_query(callback_query): return
+    await callback_query.message.edit_reply_markup()
+    id = int(callback_query.data.replace("copy_reminder_", "", 1))
+    index = check_reminder(id, user_id="all")
+    if index == "NotFound":
+        await callback_query.message.reply("Напоминание не существует!")
+        return
+    reminder = Data.reminders[index]
+    if reminder.frequency:
+        request = await create_new_often_reminder(reminder.text, reminder.str_time, callback_query.message.chat.id,
+                                                  reminder.frequency, reminder.entities, "6", id)
+    else:
+        request = await create_new_reminder(reminder.text, reminder.str_time, callback_query.message.chat.id,
+                                            reminder.entities, "6", id)
+    if request is True:
+        await callback_query.message.reply(
+            "Открытое напоминание скопировано для Вас. Посмотреть все напоминания можно здесь /my_reminders")
+    else:
+        await callback_query.message.answer("Произошла ошибка...")
+        await bot.send_message(OWNER, f"⚠️⚠️⚠️\nПроизошла ошибка (code {int(request)}) при копировании напоминания!")
 
 
 @dp.callback_query(F.data == "edit_reminder")
@@ -532,7 +628,8 @@ async def _confirm_edit_reminder(callback_query: CallbackQuery):
     if await new_callback_query(callback_query): return
     await callback_query.message.edit_text(callback_query.message.text + "\n\n✅Хорошо!")
     markup = IMarkup(inline_keyboard=[[IButton(text="Текст", callback_data="edit_text_of_reminder")],
-                                      [IButton(text="Время", callback_data="edit_time_of_reminder")]])
+                                      [IButton(text="Время", callback_data="edit_time_of_reminder")],
+                                      [IButton(text="Частота", callback_data="edit_frequency_of_reminder")]])
     await callback_query.message.answer("Что вы хотите изменить в напоминании?", reply_markup=markup)
 
 
@@ -574,13 +671,43 @@ async def _not_delete_reminder(callback_query: CallbackQuery, state: FSMContext)
     await state.clear()
 
 
+@dp.callback_query(F.data == "close_reminder")
+@security('state')
+async def _close_reminder(callback_query: CallbackQuery, state: FSMContext):
+    if await new_callback_query(callback_query): return
+    data = await state.get_data()
+    reminder_id = data['id']
+    index = check_reminder(reminder_id, callback_query.message.chat.id)
+    if index == "NotFound":
+        await state.set_state()
+        await callback_query.message.edit_reply_markup()
+        return await callback_query.message.answer("Напоминание не найдено. Если возникли трудности напишите отзыв, "
+                                                   "мы во всем разберемся")
+    reminder = Data.reminders[index]
+    if not reminder.publish:
+        return await callback_query.message.answer("Вы не можете закрыть личное напоминание. Это возможно только с публичными")
+    await db.execute("UPDATE reminders SET publish=? WHERE id=?", ("0", reminder_id))
+    reminder.publish = False
+    reminders_for_delete = []
+    for i, this_reminder in enumerate(Data.reminders):
+        if this_reminder.parent == reminder_id:
+            await db.execute("DELETE FROM reminders WHERE id=?", (this_reminder.id,))
+            reminders_for_delete.append(i)
+    for i in reminders_for_delete:
+        Data.reminders.pop(i)
+    await state.clear()
+    await callback_query.message.edit_text(callback_query.message.text + "\n\n✅Хорошо!")
+    await callback_query.message.answer("Теперь напоминание стало личным, его видите только вы, для других оно "
+                                        "удалилось безвозвратно")
+
+
 @dp.callback_query(F.data == "edit_text_of_reminder")
 @security('state')
 async def _edit_text_of_reminder(callback_query: CallbackQuery, state: FSMContext):
     if await new_callback_query(callback_query): return
     await state.set_state(UserState.edit_reminder)
     await state.update_data(edit_reminder="text")
-    await callback_query.message.edit_text(callback_query.message.text + "\nТекст", reply_markup=None)
+    await callback_query.message.edit_text(callback_query.message.text + "\nТекст")
     await callback_query.message.answer("Отправьте мне измененный текст напоминания")
 
 
@@ -590,16 +717,69 @@ async def _edit_time_of_reminder(callback_query: CallbackQuery, state: FSMContex
     if await new_callback_query(callback_query): return
     await state.set_state(UserState.edit_reminder)
     await state.update_data(edit_reminder="time")
-    await callback_query.message.edit_text(callback_query.message.text + "\nВремя", reply_markup=None)
+    await callback_query.message.edit_text(callback_query.message.text + "\nВремя")
+    index = check_reminder((await state.get_data())['reminder_id'], "all")
+    if index == "NotFound":
+        await state.clear()
+        await callback_query.message.edit_reply_markup()
+        return await callback_query.message.answer("Напоминание не найдено...")
+    reminder = Data.reminders[index]
     time_zone = Data.settings[callback_query.message.chat.id].time_zone
+    if reminder.frequency == "day" or reminder.frequency == "weekdays" or reminder.frequency == "weekend":
+        url = Data.url_select_time + time_zone
+    else:
+        url = Data.url_select_datetime + time_zone
     markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Выбрать дату и время...", web_app=WebAppInfo(
-        url=Data.url_select_datetime + time_zone))], [KeyboardButton(text="Отмена")]])
+        url=url))], [KeyboardButton(text="Отмена")]], resize_keyboard=True)
     await callback_query.message.answer("Отправьте мне новое время напоминания или нажмите ниже", reply_markup=markup)
+
+
+@dp.callback_query(F.data == "edit_frequency_of_reminder")
+@security('state')
+async def _edit_frequency_of_reminder(callback_query: CallbackQuery, state: FSMContext):
+    if await new_callback_query(callback_query): return
+    await state.set_state(UserState.edit_reminder)
+    await state.update_data(edit_reminder="frequency")
+    await callback_query.message.edit_text(callback_query.message.text + "\nЧастота")
+    buttons = []
+    for i in range(0, len(Data.frequency_reminders), 2):
+        if i + 1 != len(Data.frequency_reminders):
+            buttons.append([IButton(text=Data.frequency_reminders[i][0], callback_data=Data.frequency_reminders[i][1]),
+                            IButton(text=Data.frequency_reminders[i+1][0], callback_data=Data.frequency_reminders[i+1][1])])
+        else:
+            buttons.append([IButton(text=Data.frequency_reminders[i][0], callback_data=Data.frequency_reminders[i][1])])
+    markup = IMarkup(inline_keyboard=buttons)
+    await callback_query.message.answer("Выберите новую частоту напоминания", reply_markup=markup)
+
+
+@dp.callback_query(UserState.edit_reminder)
+@security('state')
+async def _edit_reminder_cq(callback_query: CallbackQuery, state: FSMContext):
+    if await new_callback_query(callback_query): return
+    data = await state.get_data()
+    reminder_id = data['reminder_id']
+    index = check_reminder(reminder_id, callback_query.message.chat.id)
+    await state.clear()
+    if index == "NotFound":
+        await callback_query.message.edit_reply_markup()
+        return await callback_query.message.answer("Напоминание не найдено!")
+    this_reminder = Data.reminders[index]
+    frequency = callback_query.data
+    await callback_query.message.edit_text(callback_query.message.text + f"\n\n{Data.text_frequency[frequency]}")
+    await edit_frequency_reminder(reminder_id, frequency)
+    if this_reminder.publish:
+        for reminder in Data.reminders:
+            if reminder.parent == this_reminder.id:
+                await edit_frequency_reminder(reminder.id, frequency)
+        await callback_query.message.answer("Частота напоминания изменено для Вас и всех, кто его скопировал!",
+                                            reply_markup=ReplyKeyboardRemove())
+    else:
+        await callback_query.message.answer("Частота напоминания изменено!", reply_markup=ReplyKeyboardRemove())
 
 
 @dp.message(UserState.edit_reminder)
 @security('state')
-async def _edit_reminder(message: Message, state: FSMContext):
+async def _edit_reminder_m(message: Message, state: FSMContext):
     if await new_message(message): return
     edit = (await state.get_data())['edit_reminder']
     reminder_id = (await state.get_data())['reminder_id']
@@ -624,13 +804,16 @@ async def _edit_reminder(message: Message, state: FSMContext):
             await message.answer("Текст напоминания изменен для вас и всех, кто скопировал напоминание ранее!")
         else:
             await message.answer("Текст напоминания изменен!")
-    else:
+    elif edit == "time":
         if message.text == "Отмена":
             await state.clear()
             return await message.answer("Изменение напоминания отменено", reply_markup=ReplyKeyboardRemove())
         if message.content_type not in ("text", "web_app_data"):
             return await message.answer("Некорректно!")
         str_time = message.text if message.text else message.web_app_data.data
+        this_reminder = Data.reminders[index]
+        if this_reminder.frequency == "day" or this_reminder.frequency == "weekdays" or this_reminder.frequency == "weekend":
+            str_time = f"{time_now().strftime('%Y/%m/%d')} {str_time}"
         time_reminder = check_str_time(str_time)
         if not time_reminder:
             return await message.answer("Некорректное время...")
@@ -640,7 +823,6 @@ async def _edit_reminder(message: Message, state: FSMContext):
             return await message.answer("Это время уже прошло...")
         await state.clear()
         await edit_time_reminder(reminder_id, str_time, time_reminder)
-        this_reminder = Data.reminders[index]
         if this_reminder.publish:
             for reminder in Data.reminders:
                 if reminder.parent == this_reminder.id:
@@ -655,7 +837,7 @@ async def _edit_reminder(message: Message, state: FSMContext):
 @security('state')
 async def _create_reminder(message: Message, state: FSMContext):
     if await new_message(message): return
-    await state.set_state(UserState.create_new_reminder)
+    await state.set_state(UserState.text_reminder)
     await state.update_data(day=message.text.split(" ", 1)[0].replace("/new_", "").replace("reminder", "").replace("_", ""))
     await message.answer("Напишите *текст* Вашего напоминания\nЧтобы отменить - /cancel", parse_mode=markdown)
 
@@ -664,11 +846,11 @@ async def _create_reminder(message: Message, state: FSMContext):
 @security('state')
 async def _create_often_reminder(message: Message, state: FSMContext):
     if await new_message(message): return
-    await state.set_state(UserState.create_new_often_reminder)
+    await state.set_state(UserState.text_often_reminder)
     await message.answer("Напишите *текст* напоминания\nЧтобы отменить - /cancel", parse_mode=markdown)
 
 
-@dp.message(UserState.create_new_reminder)
+@dp.message(UserState.text_reminder)
 @security('state')
 async def _text_reminder(message: Message, state: FSMContext):
     if await new_message(message): return
@@ -681,13 +863,13 @@ async def _text_reminder(message: Message, state: FSMContext):
     time_zone = Data.settings[message.chat.id].time_zone
     markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Выбрать дату и время...", web_app=WebAppInfo(
         url=Data.url_select_datetime + time_zone if not day else Data.url_select_time + time_zone))],
-                                           [KeyboardButton(text="Отмена")]])
+                                           [KeyboardButton(text="Отмена")]], resize_keyboard=True)
     await message.answer(f"Отправьте *время* напоминания или нажмите ниже\n"
                          "Чтобы отменить - /cancel", parse_mode=markdown, reply_markup=markup)
-    await state.set_state(UserState.text_new_reminder)
+    await state.set_state(UserState.time_reminder)
 
 
-@dp.message(UserState.create_new_often_reminder)
+@dp.message(UserState.text_often_reminder)
 @security('state')
 async def _text_often_reminder(message: Message, state: FSMContext):
     if await new_message(message): return
@@ -696,15 +878,39 @@ async def _text_often_reminder(message: Message, state: FSMContext):
     if len(message.text) > 128:
         return await message.answer("Текст напоминания не может быть больше 128 символов")
     await state.update_data(text=message.text, entities=message.entities)
-    time_zone = Data.settings[message.chat.id].time_zone
+    await state.set_state(UserState.frequency_reminder)
+    buttons = []
+    for i in range(0, len(Data.frequency_reminders), 2):
+        if i + 1 != len(Data.frequency_reminders):
+            buttons.append([IButton(text=Data.frequency_reminders[i][0], callback_data=Data.frequency_reminders[i][1]),
+                            IButton(text=Data.frequency_reminders[i+1][0], callback_data=Data.frequency_reminders[i+1][1])])
+        else:
+            buttons.append([IButton(text=Data.frequency_reminders[i][0], callback_data=Data.frequency_reminders[i][1])])
+    markup = IMarkup(inline_keyboard=buttons)
+    await message.answer("Выберите частоту напоминания:", reply_markup=markup)
+
+
+@dp.callback_query(UserState.frequency_reminder, F.data.in_(list(Data.text_frequency)))
+@security('state')
+async def _frequency_reminder(callback_query: CallbackQuery, state: FSMContext):
+    if await new_callback_query(callback_query): return
+    frequency = callback_query.data
+    await state.update_data(frequency=frequency)
+    await state.set_state(UserState.time_often_reminder)
+    await callback_query.message.edit_text(f"Выберите частоту напоминания:\n\n*{Data.text_frequency[frequency]}*",
+                                           parse_mode=markdown)
+    time_zone = Data.settings[callback_query.from_user.id].time_zone
+    if frequency == "day" or frequency == "weekdays" or frequency == "weekend":
+        url = Data.url_select_time + time_zone
+    else:
+        url = Data.url_select_datetime + time_zone
     markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Выбрать дату и время...", web_app=WebAppInfo(
-        url=Data.url_select_datetime + time_zone))], [KeyboardButton(text="Отмена")]])
-    await message.answer("Отправьте *время* напоминания или нажмите ниже\n"
-                         "Чтобы отменить - /cancel", parse_mode=markdown, reply_markup=markup)
-    await state.set_state(UserState.text_new_often_reminder)
+        url=url))], [KeyboardButton(text="Отмена")]], resize_keyboard=True)
+    await callback_query.message.answer("Отправьте *время* напоминания или нажмите ниже\n"
+                                        "Чтобы отменить - /cancel", parse_mode=markdown, reply_markup=markup)
 
 
-@dp.message(UserState.text_new_reminder)
+@dp.message(UserState.time_reminder)
 @security('state')
 async def _time_reminder(message: Message, state: FSMContext):
     if await new_message(message): return
@@ -734,13 +940,14 @@ async def _time_reminder(message: Message, state: FSMContext):
     if answer == -1:
         await message.answer("Это время уже прошло...")
     elif answer is True:
-        await message.answer("Ваше напоминание успешно создано", reply_markup=ReplyKeyboardRemove())
+        await message.answer("Ваше напоминание успешно создано\nВсе напоминания - /my_reminders",
+                             reply_markup=ReplyKeyboardRemove())
         await state.clear()
     else:
         await message.answer("Вы неправильно ввели дату!")
 
 
-@dp.message(UserState.text_new_often_reminder)
+@dp.message(UserState.time_often_reminder)
 @security('state')
 async def _time_often_reminder(message: Message, state: FSMContext):
     if await new_message(message): return
@@ -749,36 +956,23 @@ async def _time_often_reminder(message: Message, state: FSMContext):
         return await message.answer("Создание частого напоминания отменено", reply_markup=ReplyKeyboardRemove())
     if message.content_type not in ("text", "web_app_data"):
         return await message.answer("Некорректно!")
-    text = message.text if message.text else message.web_app_data.data
-    time = check_str_time(text)
-    if time:
-        await bot.delete_message(
-            message.chat.id,
-            (await message.answer("Время успешно обработано...", reply_markup=ReplyKeyboardRemove())).message_id)
-        await state.update_data(time=text)
-        markup = IMarkup(inline_keyboard=[
-            [IButton(text=text, callback_data=data)] for text, data in Data.frequency_reminders])
-        await message.answer("Выберите частоту напоминания:", reply_markup=markup)
-        await state.set_state(UserState.time_new_often_reminder)
-    else:
-        await message.answer("Вы неправильно ввели время")
-
-
-@dp.callback_query(UserState.time_new_often_reminder, F.data.in_(list(Data.text_frequency)))
-@security('state')
-async def _frequency_reminder(callback_query: CallbackQuery, state: FSMContext):
-    if await new_callback_query(callback_query): return
+    str_time = message.text if message.text else message.web_app_data.data
+    time_zone = Data.settings[message.chat.id].time_zone
     data = await state.get_data()
     text = data['text']
-    time = data['time']
     entities = data['entities'] or []
-    frequency = callback_query.data
-    time_zone = Data.settings[callback_query.from_user.id].time_zone
-    await create_new_often_reminder(text, time, callback_query.message.chat.id, frequency, entities, time_zone)
-    await state.clear()
-    await callback_query.message.answer("Ваше напоминание успешно создано")
-    await callback_query.message.edit_text(f"Выберите частоту напоминания:\n\n*{Data.text_frequency[frequency]}*",
-                                           parse_mode=markdown)
+    frequency = data['frequency']
+    if frequency == "day" or frequency == "weekdays" or frequency == "weekend":
+        str_time = f"{time_now().strftime('%Y/%m/%d')} {str_time}"
+    time = check_str_time(str_time)
+    if time:
+        await (await message.answer("Время успешно обработано...", reply_markup=ReplyKeyboardRemove())).delete()
+        await create_new_often_reminder(text, str_time, message.chat.id, frequency, entities, time_zone, -1)
+        await state.clear()
+        await message.answer("Ваше напоминание успешно создано\nВсе напоминания - /my_reminders")
+
+    else:
+        await message.answer("Вы неправильно ввели время")
 
 
 @dp.callback_query(F.data == "replay_reminder")
@@ -802,7 +996,16 @@ async def _replay_reminder_after(callback_query: CallbackQuery, state: FSMContex
     await state.update_data(time=time, message_id=callback_query.message.reply_to_message.message_id,
                             reminder_text=callback_query.message.reply_to_message.text,
                             reminder_entities=callback_query.message.reply_to_message.entities)
-    await callback_query.message.edit_text(f"Через сколько {'минут' if time == 'minutes' else 'часов'} повторить напоминание?")
+    if time == 'minutes':
+        word_time = "минут"
+        lines = [[5, 10, 15, 20], [25, 30, 35, 40], [45, 50, 55, 60]]
+    else:
+        word_time = "часов"
+        lines = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20], [21, 22, 23, 24]]
+    markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=str(m)) for m in line] for line in lines])
+    await callback_query.message.edit_text(f"Повторить напоминание через...\n\n✅несколько {word_time}")
+    await callback_query.message.answer(f"Через сколько {word_time} повторить напоминание?\n"
+                                        f"Нажмите на кнопку или пришлите число", reply_markup=markup)
 
 
 @dp.message(UserState.replay_reminder)
@@ -825,9 +1028,12 @@ async def _replay_reminder_after_time(message: Message, state: FSMContext):
                                         message.chat.id, reminder_entities, "6", -1)
     if request == -1:
         await message.answer("Это время уже прошло!")
+    elif request is False:
+        await message.answer("Произошла ошибка...", reply_markup=ReplyKeyboardRemove())
+        await bot.send_message(OWNER, "⚠️⚠️⚠️\nНекорректный формат времени при попытке повторить напоминание")
     else:
         await bot.send_message(message.chat.id, f"Напоминание скопировано. Время: {time.hour}:{time.minute}",
-                               reply_to_message_id=message_id)
+                               reply_to_message_id=message_id, reply_markup=ReplyKeyboardRemove())
 
 
 @dp.callback_query()
@@ -878,13 +1084,16 @@ async def create_new_reminder(text: str, str_time: str, chat_id: int, entities: 
         return False
 
 
-async def create_new_often_reminder(text: str, str_time: str, chat_id: int, frequency: str, entities: list[MessageEntity], time_zone: str):
+async def create_new_often_reminder(text: str, str_time: str, chat_id: int, frequency: str, entities: list[MessageEntity], time_zone: str, parent: int):
     _time = check_str_time(str_time)
-    _time = _time + timedelta(hours=int(time_zone) - 6)
-    id = int((await db.execute("SELECT value FROM system_data WHERE key=?", ("max_id_reminder",)))[0][0]) + 1
-    await db.execute("UPDATE system_data SET value=? WHERE key=?", (str(id), "max_id_reminder"))
-    Data.reminders.append(Reminder(id, chat_id, text, _time, str_time, frequency, entities, False, -1))
-    await db.execute("INSERT INTO reminders VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (id, chat_id, text, str_time, frequency, entities_format_list(entities), "0", -1))
+    if _time:
+        _time = _time + timedelta(hours=int(time_zone) - 6)
+        id = int((await db.execute("SELECT value FROM system_data WHERE key=?", ("max_id_reminder",)))[0][0]) + 1
+        await db.execute("UPDATE system_data SET value=? WHERE key=?", (str(id), "max_id_reminder"))
+        Data.reminders.append(Reminder(id, chat_id, text, _time, str_time, frequency, entities, False, parent))
+        await db.execute("INSERT INTO reminders VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (id, chat_id, text, str_time, frequency, entities_format_list(entities), "0", parent))
+        return True
+    return False
 
 
 async def edit_text_reminder(reminder_id: int, text: str, entities: list[MessageEntity]):
@@ -900,6 +1109,12 @@ async def edit_time_reminder(reminder_id: int, str_time: str, time_reminder: dat
     Data.reminders[index].str_time = str_time
     Data.reminders[index].time = time_reminder
     await db.execute("UPDATE reminders SET str_time=? WHERE id=?", (str_time, reminder_id))
+
+
+async def edit_frequency_reminder(reminder_id: int, frequency: str):
+    index = check_reminder(reminder_id, "all")
+    Data.reminders[index].frequency = frequency
+    await db.execute("UPDATE reminders SET frequency=? WHERE id=?", (frequency, reminder_id))
 
 
 def entities_format_str(entities: str) -> list[MessageEntity]:
@@ -941,6 +1156,7 @@ async def wait_reminders():
 async def load_reminders():
     reminder_hash = (await db.execute("SELECT value FROM system_data WHERE key=?", ("reminders_hash",)))[0][0]
     if Data.reminders_hash != reminder_hash and Data.reminders:
+        Data.settings = Settings.load_settings(await get_settings())
         reminders = await db.execute("SELECT * FROM reminders")
         Data.reminders.clear()
         Data.reminders_hash = reminder_hash
@@ -1021,6 +1237,9 @@ async def new_message(message: Message, /, forward: bool = True) -> bool:
                      (id, username, first_name, last_name, content, date))
 
     await load_reminders()
+
+    if message.web_app_data:
+        await message.answer(f"Получены данные: {message.web_app_data.data}")
 
     if message.chat.id == OWNER:
         return False
