@@ -345,6 +345,7 @@ async def _check_subscribe(callback_query: CallbackQuery):
         await callback_query.answer("Вы не подписались на наш канал😢", True)
         await callback_query.bot.send_message(OWNER, "Пользователь не подписался на канал")
     else:
+        await callback_query.message.delete()
         await callback_query.answer("Спасибо за подписку!❤️ Продолжайте пользоваться ботом", True)
         await callback_query.bot.send_message(OWNER, "Пользователь подписался на канал. Ему предоставлен полный доступ")
 

@@ -12,7 +12,7 @@ mysql = sys_keys.db
 release = sys_keys.release
 SITE = "https://tgmaksim.ru/проекты/напоминалка"
 subscribe = "https://t.me/+toIQibXWy-w1MmVi"
-channel = "@MaksimMyBots"
+channel = "@tgmaksim_ru"
 
 markdown = "Markdown"
 html = "HTML"
