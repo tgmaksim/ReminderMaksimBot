@@ -167,6 +167,9 @@ class Data:
 # Класс нужен для определения состояния пользователя в данном боте,
 # например: пользователь должен отправить отзыв в следующем сообщении
 class UserState(StatesGroup):
+    class Admin(StatesGroup):
+        mailing = State('mailing')
+
     feedback = State('feedback')
 
     text_reminder = State('text_reminder')
@@ -223,7 +226,8 @@ async def _admin(message: Message):
                          "/db - база данных бота\n"
                          "/all_reminders - все активные напоминания\n"
                          "/version - изменить версию бота\n"
-                         "/new_acquaintance - добавить знакомого")
+                         "/new_acquaintance - добавить знакомого\n"
+                         "/mailing - рассылка")
 
 
 @dp.message(Command('reload'))
@@ -270,6 +274,56 @@ async def _db(message: Message):
         await message.answer("Основной режим программы не позволяет отправить файл базы данных")
     else:
         await message.answer_document(FSInputFile(resources_path(db.db_path)))
+
+
+@dp.message(Command('mailing'))
+@security('state')
+async def _start_mailing(message: Message, state: FSMContext):
+    if await developer_command(message): return
+    await state.set_state(UserState.Admin.mailing)
+    await message.answer("Отправь сообщение, которое я разошлю все пользователям бота")
+
+
+@dp.message(UserState.Admin.mailing)
+@security('state')
+async def _mailing(message: Message, state: FSMContext):
+    if await developer_command(message): return
+    await state.update_data(message_id=message.message_id)
+    markup = IMarkup(inline_keyboard=[[IButton(text="Переслать 💬", callback_data="mailing_forward"),
+                                       IButton(text="Отправить 🔐", callback_data="mailing_send")],
+                                      [IButton(text="❌ Отмена ❌", callback_data="stop_mailing")]])
+    await message.answer("Выберите способ рассылки сообщения 👇", reply_markup=markup)
+
+
+@dp.callback_query(F.data.in_(["mailing_forward", "mailing_send", "stop_mailing"]))
+@security('state')
+async def _confirm_mailing(callback_query: CallbackQuery, state: FSMContext):
+    if await new_callback_query(callback_query): return
+    match callback_query.data:
+        case "mailing_forward":
+            await callback_query.message.edit_text(f"{callback_query.message.text}\nПересылка")
+            message_id = (await state.get_data())['message_id']
+            await state.clear()
+            fun = lambda user_id: bot.forward_message(user_id, callback_query.from_user.id, message_id)
+        case "mailing_send":
+            await callback_query.message.edit_text(f"{callback_query.message.text}\nОтправка")
+            message_id = (await state.get_data())['message_id']
+            await state.clear()
+            fun = lambda user_id: bot.copy_message(user_id, callback_query.from_user.id, message_id)
+        case _:
+            await state.clear()
+            return await callback_query.message.edit_text("Операция отменена!")
+    result = [len(Data.users), 0, 0]
+    for user in Data.users:
+        try:
+            await fun(user)
+        except TelegramBadRequest:
+            result[1] += 1  # Количество ошибок
+        else:
+            result[2] += 1  # Количество доставленных сообщений
+        await asyncio.sleep(1)
+    await callback_query.message.answer(f"Рассылка завершена!\nВсего пользователей: {result[0]}\n"
+                                        f"Доставлено сообщений: {result[2]}\nПроизошло ошибок: {result[1]}")
 
 
 @dp.message(Command('all_reminders'))
@@ -473,6 +527,13 @@ async def _start(message: Message, state: FSMContext):
         await message.answer(f"Привет, {await username_acquaintance(message, 'first_name')}\n"
                              f"[tgmaksim.ru]({SITE})",
                              parse_mode=markdown, reply_markup=markup)
+
+    if not Data.settings.get(message.chat.id):
+        Data.settings[message.chat.id] = Settings.default(message.chat.id)
+        await set_time_zone(message.chat.id, 6)
+        markup = IMarkup(inline_keyboard=[[IButton(text="Настройки", callback_data="settings")]])
+        await message.answer("Сейчас я использую часовой пояс +6 (Омск). Если вы живете в другом регионе, то можете "
+                             "изменить свое время в настройках", reply_markup=markup)
 
 
 @dp.message(Command('help'))
